@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+mediator.sqlite3
+mediator.sqlite3-shm
+mediator.sqlite3-wal
+.streamlit/secrets.toml
