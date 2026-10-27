@@ -1,4 +1,5 @@
 import hashlib
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -52,7 +53,7 @@ class StorageTests(unittest.TestCase):
         with storage._connect(self.db_path) as connection:
             stored_hash = connection.execute(
                 "SELECT password_hash FROM users WHERE username = 'user_a'"
-            ).fetchone()[0]
+            ).fetchone()["password_hash"]
         self.assertNotEqual(stored_hash, "a-very-long-test-password-1")
 
     def test_duplicate_usernames_are_rejected_case_insensitively(self) -> None:
@@ -276,6 +277,62 @@ class StorageTests(unittest.TestCase):
         storage.save_report(self.user_a["user_id"], room_id, "Report", self.db_path)
         storage.delete_room(self.user_a["user_id"], room_id, self.db_path)
         self.assertEqual(storage.list_user_rooms(self.user_b["user_id"], self.db_path), [])
+
+    def test_delete_user_removes_account_and_rooms(self) -> None:
+        room_id, _ = self.make_pair()
+        storage.save_summary(self.user_a["user_id"], room_id, "summary", True, self.db_path)
+        with self.assertRaises(storage.StorageError) as caught:
+            storage.delete_user(self.user_a["user_id"], "wrong-password-123", self.db_path)
+        self.assertEqual(caught.exception.code, "err_wrong_password")
+
+        storage.delete_user(
+            self.user_a["user_id"], "a-very-long-test-password-1", self.db_path
+        )
+        self.assertIsNone(
+            storage.authenticate_user("user_a", "a-very-long-test-password-1", self.db_path)
+        )
+        self.assertEqual(storage.list_user_rooms(self.user_b["user_id"], self.db_path), [])
+        self.assertIsNotNone(
+            storage.authenticate_user("user_b", "a-very-long-test-password-2", self.db_path)
+        )
+
+    def test_login_is_case_insensitive(self) -> None:
+        self.assertIsNotNone(
+            storage.authenticate_user("USER_A", "a-very-long-test-password-1", self.db_path)
+        )
+        with self.assertRaises(storage.StorageError) as caught:
+            storage.register_user("User_A", "another-long-password-1", self.db_path)
+        self.assertEqual(caught.exception.code, "err_username_taken")
+
+
+TEST_DATABASE_URL = os.getenv("MEDIATOR_TEST_DATABASE_URL", "")
+
+
+@unittest.skipUnless(
+    TEST_DATABASE_URL, "set MEDIATOR_TEST_DATABASE_URL to run against PostgreSQL"
+)
+class PostgresStorageTests(StorageTests):
+    """Runs every storage test against PostgreSQL. All tables are dropped first,
+    so point this at an empty test database, never at production."""
+
+    def setUp(self) -> None:
+        storage.configure(TEST_DATABASE_URL)
+        self.drop_tables()
+        self.db_path = None
+        storage.initialize_storage()
+        self.user_a = storage.register_user("user_a", "a-very-long-test-password-1")
+        self.user_b = storage.register_user("user_b", "a-very-long-test-password-2")
+
+    def tearDown(self) -> None:
+        self.drop_tables()
+        storage.configure("")
+
+    def drop_tables(self) -> None:
+        with storage._connect() as connection:
+            connection.execute(
+                "DROP TABLE IF EXISTS report_generation, reports, summaries, "
+                "memberships, rooms, users CASCADE"
+            )
 
 
 if __name__ == "__main__":

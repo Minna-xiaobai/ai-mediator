@@ -1,3 +1,10 @@
+"""Account, room, summary, and report storage.
+
+Uses PostgreSQL when a database URL is configured (cloud deployment) and a
+local SQLite file otherwise. Queries are written once with ``?`` placeholders
+and translated for PostgreSQL by ``_PostgresConnection``.
+"""
+
 import hashlib
 import hmac
 import os
@@ -19,10 +26,37 @@ INVITE_TTL_SECONDS = 24 * 60 * 60
 MAX_SUMMARY_LENGTH = 4000
 _USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,32}$")
 _INVITE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+# Serialises PostgreSQL transactions that SQLite runs under BEGIN IMMEDIATE.
+_PG_LOCK_KEY = 73_100_001
+
+_database_url = os.getenv("DATABASE_URL", "").strip()
+_pg_pool = None
 
 
 class StorageError(Exception):
-    """Raised when an account, invite, or room operation is invalid."""
+    """Raised when an account, invite, or room operation is invalid.
+
+    ``code`` is a translation key (see i18n.py); ``params`` fill its placeholders.
+    """
+
+    def __init__(self, code: str, **params: Any) -> None:
+        super().__init__(code)
+        self.code = code
+        self.params = params
+
+
+def configure(database_url: str) -> None:
+    """Use PostgreSQL at database_url for calls that do not pass a db_path."""
+    global _database_url, _pg_pool
+    database_url = database_url.strip()
+    if database_url != _database_url and _pg_pool is not None:
+        _pg_pool.close()
+        _pg_pool = None
+    _database_url = database_url
+
+
+def using_postgres() -> bool:
+    return bool(_database_url)
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -33,7 +67,62 @@ class _ClosingConnection(sqlite3.Connection):
             self.close()
 
 
-def _connect(db_path: str | Path | None = None) -> sqlite3.Connection:
+class _PostgresConnection:
+    """Gives a pooled psycopg connection the small sqlite3-style API used here."""
+
+    def __init__(self, pool) -> None:
+        self._pool_context = pool.connection()
+        self._connection = None
+
+    def __enter__(self) -> "_PostgresConnection":
+        self._connection = self._pool_context.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self._pool_context.__exit__(exc_type, exc_value, traceback)
+
+    def execute(self, sql: str, params: tuple = ()):
+        if sql.strip() == "BEGIN IMMEDIATE":
+            return self._connection.execute(
+                "SELECT pg_advisory_xact_lock(%s)", (_PG_LOCK_KEY,)
+            )
+        return self._connection.execute(sql.replace("?", "%s"), params)
+
+    def executescript(self, script: str) -> None:
+        for statement in script.split(";"):
+            if statement.strip():
+                self._connection.execute(statement)
+
+
+def _postgres_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        from psycopg.rows import dict_row
+        from psycopg_pool import ConnectionPool
+
+        # prepare_threshold=None keeps this compatible with transaction-mode
+        # poolers such as Supabase's, which do not support prepared statements.
+        _pg_pool = ConnectionPool(
+            _database_url,
+            min_size=1,
+            max_size=5,
+            kwargs={"row_factory": dict_row, "prepare_threshold": None},
+            open=True,
+        )
+    return _pg_pool
+
+
+def _integrity_errors() -> tuple[type[Exception], ...]:
+    if not using_postgres():
+        return (sqlite3.IntegrityError,)
+    import psycopg
+
+    return (sqlite3.IntegrityError, psycopg.IntegrityError)
+
+
+def _connect(db_path: str | Path | None = None):
+    if db_path is None and using_postgres():
+        return _PostgresConnection(_postgres_pool())
     path = Path(db_path) if db_path is not None else DATABASE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=10, factory=_ClosingConnection)
@@ -42,56 +131,116 @@ def _connect(db_path: str | Path | None = None) -> sqlite3.Connection:
     return connection
 
 
+_SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_salt TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rooms (
+    room_id TEXT PRIMARY KEY,
+    invite_hash TEXT NOT NULL UNIQUE,
+    invite_expires_at INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('waiting', 'paired')),
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memberships (
+    room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('A', 'B')),
+    joined_at INTEGER NOT NULL,
+    PRIMARY KEY (room_id, user_id),
+    UNIQUE (room_id, role)
+);
+CREATE TABLE IF NOT EXISTS summaries (
+    room_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    consent INTEGER NOT NULL CHECK (consent IN (0, 1)),
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (room_id, user_id),
+    FOREIGN KEY (room_id, user_id)
+        REFERENCES memberships(room_id, user_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS reports (
+    room_id TEXT PRIMARY KEY REFERENCES rooms(room_id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS report_generation (
+    room_id TEXT PRIMARY KEY REFERENCES rooms(room_id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    lease_expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memberships_user_idx
+    ON memberships(user_id, room_id);
+"""
+
+# Row level security is enabled with no policies so that hosted Postgres
+# providers' public REST APIs (e.g. Supabase) cannot read these tables; the
+# table owner used by this app bypasses RLS.
+_POSTGRES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    password_salt TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at BIGINT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx ON users (lower(username));
+CREATE TABLE IF NOT EXISTS rooms (
+    room_id TEXT PRIMARY KEY,
+    invite_hash TEXT NOT NULL UNIQUE,
+    invite_expires_at BIGINT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('waiting', 'paired')),
+    created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memberships (
+    room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('A', 'B')),
+    joined_at BIGINT NOT NULL,
+    PRIMARY KEY (room_id, user_id),
+    UNIQUE (room_id, role)
+);
+CREATE TABLE IF NOT EXISTS summaries (
+    room_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    consent INTEGER NOT NULL CHECK (consent IN (0, 1)),
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (room_id, user_id),
+    FOREIGN KEY (room_id, user_id)
+        REFERENCES memberships(room_id, user_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS reports (
+    room_id TEXT PRIMARY KEY REFERENCES rooms(room_id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS report_generation (
+    room_id TEXT PRIMARY KEY REFERENCES rooms(room_id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    lease_expires_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memberships_user_idx ON memberships(user_id, room_id);
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE rooms ENABLE ROW LEVEL SECURITY;
+ALTER TABLE memberships ENABLE ROW LEVEL SECURITY;
+ALTER TABLE summaries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reports ENABLE ROW LEVEL SECURITY;
+ALTER TABLE report_generation ENABLE ROW LEVEL SECURITY
+"""
+
+
 def initialize_storage(db_path: str | Path | None = None) -> None:
+    postgres = db_path is None and using_postgres()
     with _connect(db_path) as connection:
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id TEXT PRIMARY KEY,
-                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                password_salt TEXT NOT NULL,
-                password_hash TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS rooms (
-                room_id TEXT PRIMARY KEY,
-                invite_hash TEXT NOT NULL UNIQUE,
-                invite_expires_at INTEGER NOT NULL,
-                status TEXT NOT NULL CHECK (status IN ('waiting', 'paired')),
-                created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS memberships (
-                room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
-                user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-                role TEXT NOT NULL CHECK (role IN ('A', 'B')),
-                joined_at INTEGER NOT NULL,
-                PRIMARY KEY (room_id, user_id),
-                UNIQUE (room_id, role)
-            );
-            CREATE TABLE IF NOT EXISTS summaries (
-                room_id TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                consent INTEGER NOT NULL CHECK (consent IN (0, 1)),
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (room_id, user_id),
-                FOREIGN KEY (room_id, user_id)
-                    REFERENCES memberships(room_id, user_id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS reports (
-                room_id TEXT PRIMARY KEY REFERENCES rooms(room_id) ON DELETE CASCADE,
-                content TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS report_generation (
-                room_id TEXT PRIMARY KEY REFERENCES rooms(room_id) ON DELETE CASCADE,
-                user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-                lease_expires_at INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS memberships_user_idx
-                ON memberships(user_id, room_id);
-            """
-        )
+        if postgres:
+            connection.execute("BEGIN IMMEDIATE")
+        connection.executescript(_POSTGRES_SCHEMA if postgres else _SQLITE_SCHEMA)
 
 
 REPORT_GENERATION_LEASE_SECONDS = 300
@@ -109,7 +258,7 @@ def get_report_generation_state(
             (room_id, user_id),
         ).fetchone()
         if membership is None:
-            raise StorageError("找不到此配對，或你沒有存取權限。")
+            raise StorageError("err_room_not_found")
         report = connection.execute(
             "SELECT 1 FROM reports WHERE room_id = ?", (room_id,)
         ).fetchone()
@@ -137,7 +286,7 @@ def claim_report_generation(
             (room_id, user_id),
         ).fetchone()
         if membership is None:
-            raise StorageError("找不到此配對，或你沒有存取權限。")
+            raise StorageError("err_room_not_found")
 
         report = connection.execute(
             "SELECT 1 FROM reports WHERE room_id = ?", (room_id,)
@@ -146,19 +295,19 @@ def claim_report_generation(
             return "completed"
 
         member_count = connection.execute(
-            "SELECT COUNT(*) FROM memberships WHERE room_id = ?", (room_id,)
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS n FROM memberships WHERE room_id = ?", (room_id,)
+        ).fetchone()["n"]
         consent_count = connection.execute(
             """
-            SELECT COUNT(*) FROM memberships AS m
+            SELECT COUNT(*) AS n FROM memberships AS m
             JOIN summaries AS s
               ON s.room_id = m.room_id AND s.user_id = m.user_id
             WHERE m.room_id = ? AND s.consent = 1
             """,
             (room_id,),
-        ).fetchone()[0]
+        ).fetchone()["n"]
         if member_count != 2 or consent_count != 2:
-            raise StorageError("雙方都同意分享摘要後才能開始調解。")
+            raise StorageError("err_consent_required")
 
         cursor = connection.execute(
             """
@@ -199,9 +348,9 @@ def register_user(
 ) -> dict[str, str]:
     normalized_username = username.strip()
     if not _USERNAME_PATTERN.fullmatch(normalized_username):
-        raise StorageError("帳號需為 3–32 個英文字母、數字或底線。")
+        raise StorageError("err_username_format")
     if not 12 <= len(password) <= 128:
-        raise StorageError("密碼長度需介於 12 到 128 個字元。")
+        raise StorageError("err_password_length")
 
     salt = secrets.token_bytes(16)
     user = {
@@ -226,8 +375,8 @@ def register_user(
                     int(user["created_at"]),
                 ),
             )
-    except sqlite3.IntegrityError as error:
-        raise StorageError("此帳號名稱已被使用。") from error
+    except _integrity_errors() as error:
+        raise StorageError("err_username_taken") from error
     return {"user_id": user["user_id"], "username": user["username"]}
 
 
@@ -240,7 +389,7 @@ def authenticate_user(
         row = connection.execute(
             """
             SELECT user_id, username, password_salt, password_hash
-            FROM users WHERE username = ? COLLATE NOCASE
+            FROM users WHERE lower(username) = lower(?)
             """,
             (username.strip(),),
         ).fetchone()
@@ -251,6 +400,33 @@ def authenticate_user(
     if not hmac.compare_digest(candidate_hash.hex(), row["password_hash"]):
         return None
     return {"user_id": row["user_id"], "username": row["username"]}
+
+
+def delete_user(
+    user_id: str,
+    password: str,
+    db_path: str | Path | None = None,
+) -> None:
+    """Delete an account and every room it belongs to, after re-checking the password."""
+    with _connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT password_salt, password_hash FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is None or not hmac.compare_digest(
+            _password_hash(password, bytes.fromhex(row["password_salt"])).hex(),
+            row["password_hash"],
+        ):
+            raise StorageError("err_wrong_password")
+        connection.execute(
+            """
+            DELETE FROM rooms WHERE room_id IN (
+                SELECT room_id FROM memberships WHERE user_id = ?
+            )
+            """,
+            (user_id,),
+        )
+        connection.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
 
 
 def create_room(
@@ -266,7 +442,7 @@ def create_room(
             "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
         ).fetchone()
         if user_exists is None:
-            raise StorageError("請重新登入後再建立配對。")
+            raise StorageError("err_relogin")
         connection.execute(
             """
             INSERT INTO rooms (room_id, invite_hash, invite_expires_at, status, created_at)
@@ -293,7 +469,7 @@ def join_room(
     if len(normalized_code) != 10 or any(
         char not in _INVITE_ALPHABET for char in normalized_code
     ):
-        raise StorageError("邀請碼無效、已使用或已過期。")
+        raise StorageError("err_invite_invalid")
     invite_hash = hashlib.sha256(normalized_code.encode("ascii")).hexdigest()
     now = int(time.time())
 
@@ -308,11 +484,11 @@ def join_room(
             or room["invite_expires_at"] < now
             or room["status"] != "waiting"
         ):
-            raise StorageError("邀請碼無效、已使用或已過期。")
+            raise StorageError("err_invite_invalid")
         member_count = connection.execute(
-            "SELECT COUNT(*) FROM memberships WHERE room_id = ?",
+            "SELECT COUNT(*) AS n FROM memberships WHERE room_id = ?",
             (room["room_id"],),
-        ).fetchone()[0]
+        ).fetchone()["n"]
         already_member = connection.execute(
             "SELECT 1 FROM memberships WHERE room_id = ? AND user_id = ?",
             (room["room_id"], user_id),
@@ -321,7 +497,7 @@ def join_room(
             "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
         ).fetchone()
         if member_count != 1 or user_exists is None or already_member is not None:
-            raise StorageError("邀請碼無效、已使用或已過期。")
+            raise StorageError("err_invite_invalid")
 
         connection.execute(
             """
@@ -389,7 +565,7 @@ def save_summary(
 ) -> None:
     value = content.strip()
     if not value or len(value) > MAX_SUMMARY_LENGTH:
-        raise StorageError(f"摘要長度需介於 1 到 {MAX_SUMMARY_LENGTH} 個字元。")
+        raise StorageError("err_summary_length", max=MAX_SUMMARY_LENGTH)
     now = int(time.time())
     with _connect(db_path) as connection:
         is_member = connection.execute(
@@ -397,7 +573,7 @@ def save_summary(
             (room_id, user_id),
         ).fetchone()
         if is_member is None:
-            raise StorageError("找不到此配對，或你沒有存取權限。")
+            raise StorageError("err_room_not_found")
         existing = connection.execute(
             "SELECT content, consent FROM summaries WHERE room_id = ? AND user_id = ?",
             (room_id, user_id),
@@ -454,7 +630,7 @@ def get_room_consents(
             (room_id, user_id),
         ).fetchone()
         if membership is None:
-            raise StorageError("找不到此配對，或你沒有存取權限。")
+            raise StorageError("err_room_not_found")
         rows = connection.execute(
             """
             SELECT m.role, COALESCE(s.consent, 0) AS consent
@@ -500,7 +676,7 @@ def save_report(
 ) -> None:
     value = report.strip()
     if not value:
-        raise StorageError("調解報告不可為空白。")
+        raise StorageError("err_report_empty")
     with _connect(db_path) as connection:
         connection.execute("BEGIN IMMEDIATE")
         generation = connection.execute(
@@ -516,29 +692,28 @@ def save_report(
         ).fetchone()
         consent_count = connection.execute(
             """
-            SELECT COUNT(*) FROM memberships AS m
+            SELECT COUNT(*) AS n FROM memberships AS m
             JOIN summaries AS s
               ON s.room_id = m.room_id AND s.user_id = m.user_id
             WHERE m.room_id = ? AND s.consent = 1
             """,
             (room_id,),
-        ).fetchone()[0]
+        ).fetchone()["n"]
         member_count = connection.execute(
-            "SELECT COUNT(*) FROM memberships WHERE room_id = ?",
+            "SELECT COUNT(*) AS n FROM memberships WHERE room_id = ?",
             (room_id,),
-        ).fetchone()[0]
+        ).fetchone()["n"]
         if membership is None:
-            raise StorageError("找不到此配對，或你沒有存取權限。")
+            raise StorageError("err_room_not_found")
         if generation is None:
-            raise StorageError(
-                "此調解請求已失效或由另一位使用者處理，請重新整理查看共同報告。"
-            )
+            raise StorageError("err_report_stale")
         if member_count != 2 or consent_count != 2:
-            raise StorageError("雙方都同意分享摘要後才能儲存調解報告。")
+            raise StorageError("err_consent_required")
         connection.execute(
             """
-            INSERT OR IGNORE INTO reports (room_id, content, created_at)
+            INSERT INTO reports (room_id, content, created_at)
             VALUES (?, ?, ?)
+            ON CONFLICT (room_id) DO NOTHING
             """,
             (room_id, value, int(time.time())),
         )
@@ -558,7 +733,7 @@ def get_report(
             (room_id, user_id),
         ).fetchone()
         if membership is None:
-            raise StorageError("找不到此配對，或你沒有存取權限。")
+            raise StorageError("err_room_not_found")
         row = connection.execute(
             "SELECT content FROM reports WHERE room_id = ?", (room_id,)
         ).fetchone()
@@ -576,5 +751,5 @@ def delete_room(
             (room_id, user_id),
         ).fetchone()
         if membership is None:
-            raise StorageError("找不到此配對，或你沒有存取權限。")
+            raise StorageError("err_room_not_found")
         connection.execute("DELETE FROM rooms WHERE room_id = ?", (room_id,))
